@@ -33,9 +33,48 @@
 /* USER CODE BEGIN PD */
 
 #define PWM_MAX          1000   /* ARR+1：PWM 满量程 */
-#define SPEED            600    /* 默认速度（占空比 60%） */
-#define CAR_TIMEOUT_MS   800    /* 超过这么久没收到指令 → 自动停车（断连保护） */
+#define SPEED            1000   /* 默认速度（占空比 100%）。排查阶段先拉满，确认电机能转
+                                   再按需往下调；正式玩的时候建议 600~800 */
+#define CAR_TIMEOUT_MS   10000  /* 指令保持时间 / 断连保护，单位 ms
+                                   · 收到方向指令后车一直按该方向走，直到收到 S 或别的方向
+                                   · 只有超过这么久一个合法指令都收不到，才自动停车当兜底
+                                   · 手机 App 不支持连发时，这个值就等于"一次指令能走多久"：
+                                     10 秒足够看清动作，手机真掉线了车也不会跑飞 */
 #define SPEED_STEP       111    /* 档位 1~9 每档对应的 PWM 值（9×111≈999） */
+
+/* 调试回显开关：1=手机发什么字符，单片机就原样发回去（用来确认蓝牙链路双向通）
+   验收阶段保持 1；车能正常开了以后改成 0，模组就只会"听"不会"说" */
+#define DEBUG_UART_ECHO  1
+
+/* 每秒心跳：1=单片机每秒往手机发一次 "OK\r\n"
+   注意这会和回显混在一起，手机屏幕上会一直刷。排查阶段够用了，现在关掉 */
+#define DEBUG_UART_HEARTBEAT 0
+
+/* ===== 广播率测试：改这一个数就能试不同波特率 =====
+   HC-05 常见出厂值：9600。被改过的话常见 38400 / 115200 / 57600 / 4800
+   判断标准：手机里能稳定看到"每秒一个 OK"，就是对的，其余都是错的 */
+#define UART_BAUD_TEST   9600
+
+/* ===== 静默诊断开关 =====
+   置 1：单片机完全不发任何串口数据，只用板载 LED 快闪表示程序在跑。
+         2026-11-01 已验证结论：静默时手机不再刷乱码 → 乱码确实是单片机发出的数据
+   置 0：关闭静默（现在已定位完成，改回 0） */
+#define UART_SILENT_TEST 0
+
+/* ===== 波特率自动扫描（当前 = 1，正在找模块真正的波特率）=====
+   置 1：固件每 5 秒自动换一个波特率，同时发 "OK"，用 LED 闪几下表示当前是第几个：
+             1 = 9600     2 = 19200    3 = 38400
+             4 = 57600    5 = 115200   6 = 4800
+         手机里出现干干净净的 "OK" 时，回想 LED 刚才闪了几下，就知道模块是多少。
+   置 0：关闭扫描（找到正确值后，把 UART_BAUD_TEST 改成它，再把这个改 0） */
+#define UART_SCAN_MODE   0
+
+/* ===== 单片机串口自检（当前 = 0，已完成使命）=====
+   2026-11-01 结论：自检通过（PC13 每 2 秒快闪 3 下）→ PA9/PA10 收发正常。
+   同日用 USB-TTL 直连模块跑 AT 指令，8 条全回 OK（固件 2.0-20100601，
+   UART=9600,0,0，ROLE=0，PSWD=1234）→ 模块也是好的。
+   所以现在改回 0，进入正常工作模式。 */
+#define UART_SELFTEST_MODE 0
 
 /* USER CODE END PD */
 
@@ -47,14 +86,30 @@
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef htim3;
 
+UART_HandleTypeDef huart1;
+
 /* USER CODE BEGIN PV */
 
 uint8_t  rx_byte;                    /* 串口中断每收到 1 字节就存这里 */
 volatile uint8_t  car_cmd = 'S';     /* 最新收到的指令（volatile：中断和主循环共享） */
 volatile uint32_t last_cmd_tick = 0; /* 最后一次收到指令的时刻（ms） */
 
+/* 收到"任意"字节的累计数（不管合不合法、不管是不是噪声）。
+   主循环盯它变化与否，就能判断线上到底有没有数据进来 —— 这是排查链路的关键仪表 */
+volatile uint32_t rx_any_cnt = 0;
+
 static uint16_t g_speed = SPEED;     /* 当前速度 */
-static uint8_t  g_dir   = 0;         /* 当前方向：0停 1前 -1后 2左 3右 */
+/* 注意必须是 int8_t（有符号）：要能存 -1。用 uint8_t 存 -1 会变成 255，后退永远失效 */
+static int8_t   g_dir   = 0;         /* 当前方向：0停 1前 -1后 2左 3右 */
+
+#if DEBUG_UART_ECHO
+volatile uint8_t echo_pending = 0;   /* 中断置 1，主循环负责把收到的字符发回手机 */
+volatile uint8_t echo_char    = 0;   /* 要回显的字符 */
+#endif
+
+#if UART_SELFTEST_MODE
+volatile uint32_t selftest_rx_cnt = 0;   /* 自检时：成功收回来的 0x55 计数 */
+#endif
 
 /* USER CODE END PV */
 
@@ -62,6 +117,7 @@ static uint8_t  g_dir   = 0;         /* 当前方向：0停 1前 -1后 2左 3右
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 static void Motor_Left(int dir);
@@ -70,6 +126,10 @@ static void Car_Run(int dir, uint16_t speed);
 static void Car_TurnLeft(uint16_t speed);
 static void Car_TurnRight(uint16_t speed);
 static void Car_Stop(void);
+static uint8_t Cmd_IsValid(uint8_t c);
+#if UART_SCAN_MODE
+static void UART_ScanApply(uint8_t idx);
+#endif
 
 /* USER CODE END PFP */
 
@@ -108,6 +168,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_TIM3_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
@@ -115,8 +176,42 @@ int main(void)
   Car_Stop(); 
 
   /* 打开串口中断接收：收满 1 字节会自动调用 HAL_UART_RxCpltCallback */
+
+  /* ---- 临时覆盖波特率（在 USER CODE 区里，CubeMX 重新生成也不会被冲掉）---- */
+  huart1.Init.BaudRate = UART_BAUD_TEST;
+  if (HAL_UART_Init(&huart1) != HAL_OK) { Error_Handler(); }
+
+  /* ============ 关键修复：USART1_RX(PA10) 必须开内部上拉 ============
+     CubeMX 默认把它生成成 GPIO_NOPULL（浮空输入），这是有问题的：
+       · HC-05 模块的 TXD 输出串了限流电阻，驱动能力偏弱
+       · 引脚浮空时，整条线（PA10 + 杜邦线 + 模块TXD）会被吊在 0.99V 左右
+       · STM32 判不出高电平，UART 一个字节也解析不出来 → 看起来"完全没数据"
+     佐证：同一根线上接 CH340 就能收到数据，因为 CH340 的 RXD 内部自带
+           上拉电阻，把弱驱动信号拉起来了。换成 STM32 浮空输入就废了。
+     注意：本段必须在 HAL_UART_Init() 之后执行，因为 MspInit 里会重新配 GPIO。
+     ================================================================= */
+  {
+    GPIO_InitTypeDef rx_init = {0};
+    rx_init.Pin  = GPIO_PIN_10;          /* USART1_RX */
+    rx_init.Mode = GPIO_MODE_INPUT;
+    rx_init.Pull = GPIO_PULLUP;          /* 空闲时被拉到 3.3V，才能识别起始位 */
+    HAL_GPIO_Init(GPIOA, &rx_init);
+  }
+
   HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
   last_cmd_tick = HAL_GetTick();
+
+  /* 诊断用：把板载 LED（PC13）配成输出，作为"程序还活着"的指示灯 */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  {
+    GPIO_InitTypeDef led_init = {0};
+    led_init.Pin   = GPIO_PIN_13;
+    led_init.Mode  = GPIO_MODE_OUTPUT_PP;
+    led_init.Pull  = GPIO_NOPULL;
+    led_init.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &led_init);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);   /* PC13 低电平点亮，先灭掉 */
+  }
 
   /* USER CODE END 2 */
 
@@ -125,9 +220,171 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-     
+
     /* USER CODE BEGIN 3 */
     uint8_t cmd = car_cmd;            /* 先拷贝一份，避免读的过程中被中断改掉 */
+
+    /* ================= 板载 LED 诊断仪表（PC13，低电平点亮） =================
+       灯默认灭，只有两种情况会亮 150ms 然后自己灭：
+
+       ① 每 2 秒亮一次（心跳）→ 证明程序在跑、没卡死
+          灯从来不亮 = 没供电 / 固件没烧进去 / 程序死在启动阶段
+
+       ② 每收到一个串口字节就亮一次 → 证明单片机从 PA9 真收到数据了
+
+       怎么读：
+         没发数据时        → 每 2 秒稳稳闪一下         = 单片机活着
+         手机发数据时      → 闪成一片、密集闪烁         = 收到了，链路通
+         手机发数据时      → 还是每 2 秒一下、没变化    = 单片机压根没收到 → PA9 断了
+         收到数据有闪、手机却无回显 → PA10 到模块 TXD 这条线断了
+       ==================================================================== */
+    static uint32_t beat_tick    = 0;   /* 心跳计时 */
+    static uint32_t led_off_tick = 0;   /* 灭灯计时 */
+    static uint32_t last_rx_any  = 0;   /* 上一次看到的收字节计数 */
+    static uint8_t  led_on       = 0;   /* 灯当前是否亮着 */
+
+    uint8_t want_on = 0;
+
+    if ((HAL_GetTick() - beat_tick) >= 2000)        /* ① 心跳：每 2 秒 */
+    {
+      beat_tick = HAL_GetTick();
+      want_on = 1;
+    }
+
+    if (rx_any_cnt != last_rx_any)                  /* ② 收到字节：来一个闪一次 */
+    {
+      last_rx_any = rx_any_cnt;
+      want_on = 1;
+    }
+
+    if (want_on && !led_on)
+    {
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);   /* 低电平点亮 */
+      led_on = 1;
+      led_off_tick = HAL_GetTick();
+    }
+    else if (led_on && ((HAL_GetTick() - led_off_tick) >= 150))
+    {
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);     /* 高电平熄灭 */
+      led_on = 0;
+    }
+
+#if UART_SCAN_MODE && !UART_SELFTEST_MODE
+    /* ---- 波特率自动扫描 ----
+       每 5 秒换一个波特率，换的时候 LED 先闪 N 下，N 就是当前编号：
+       1=9600  2=19200  3=38400  4=57600  5=115200  6=4800
+       手机上看到干净的 "OK" 时，回想 LED 闪了几下即可 */
+    static uint8_t  scan_idx   = 0;
+    static uint32_t scan_tick  = 0;
+    static uint32_t send_tick  = 0;
+    static uint8_t  blink_left = 0;
+    static uint32_t blink_tick = 0;
+    static uint8_t  first_run  = 1;
+
+    if (first_run)                    /* 第一轮：9600，先闪 1 下 */
+    {
+      first_run  = 0;
+      blink_left = 2;
+      blink_tick = HAL_GetTick();
+      scan_tick  = HAL_GetTick();
+      send_tick  = HAL_GetTick();
+    }
+
+    if ((HAL_GetTick() - scan_tick) >= 5000)
+    {
+      scan_tick  = HAL_GetTick();
+      scan_idx   = (uint8_t)((scan_idx + 1U) % 6U);
+      UART_ScanApply(scan_idx);                       /* 切波特率 */
+      blink_left = (uint8_t)((scan_idx + 1U) * 2U);   /* 闪 N 下 = 翻转 2N 次 */
+      blink_tick = HAL_GetTick();
+      send_tick  = HAL_GetTick();
+    }
+
+    if ((blink_left > 0U) && ((HAL_GetTick() - blink_tick) >= 300))
+    {
+      blink_tick = HAL_GetTick();
+      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+      blink_left--;
+    }
+
+    if ((HAL_GetTick() - send_tick) >= 1000)          /* 每秒发一次 OK */
+    {
+      send_tick = HAL_GetTick();
+      if (HAL_UART_Transmit(&huart1, (uint8_t *)"OK\r\n", 4, 50) != HAL_OK)
+      {
+        huart1.gState = HAL_UART_STATE_READY;         /* 防卡死在 BUSY_TX */
+      }
+    }
+#endif
+
+#if UART_SELFTEST_MODE
+    /* ---- 单片机串口自检：自己发 0x55，从 PA10 收回来 ----
+       前提：PA9 与 PA10 用一根杜邦线短接，蓝牙模块的数据线全部拔掉 */
+    static uint32_t st_tx_tick = 0, st_chk_tick = 0, st_blink_tick = 0;
+    static uint8_t  st_blink = 0;
+
+    if ((HAL_GetTick() - st_tx_tick) >= 300)
+    {
+      uint8_t u = 0x55;
+      st_tx_tick = HAL_GetTick();
+      if (HAL_UART_Transmit(&huart1, &u, 1, 5) != HAL_OK)
+      {
+        huart1.gState = HAL_UART_STATE_READY;
+      }
+    }
+
+    if ((HAL_GetTick() - st_chk_tick) >= 2000)   /* 每 2 秒结算一次 */
+    {
+      st_chk_tick = HAL_GetTick();
+      st_blink = (selftest_rx_cnt >= 3U) ? 6U : 2U;   /* 通：翻转6次(闪3下)；不通：翻转2次(闪1下) */
+      selftest_rx_cnt = 0;
+      st_blink_tick = HAL_GetTick();
+    }
+
+    if ((st_blink > 0U) && ((HAL_GetTick() - st_blink_tick) >= 120))
+    {
+      st_blink_tick = HAL_GetTick();
+      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+      st_blink--;
+    }
+#endif
+
+#if UART_SILENT_TEST
+    /* ---- 静默诊断：一个字节都不发，只用 LED 快闪表示程序在跑 ----
+       如果这时候手机上还有乱码，那就跟单片机发送无关，是线路噪声/模块自己吐的 */
+    static uint32_t led_tick = 0;
+    if ((HAL_GetTick() - led_tick) >= 150)
+    {
+      led_tick = HAL_GetTick();
+      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    }
+#endif
+
+#if DEBUG_UART_ECHO && !UART_SILENT_TEST && !UART_SCAN_MODE && !UART_SELFTEST_MODE
+    /* ---- 0. 调试专用：回显 + 每秒心跳（链路通了以后把 DEBUG_UART_ECHO 改 0 即可关掉） ---- */
+    static uint32_t dbg_tick = 0;
+
+    if (echo_pending)                 /* 收到字符 → 原样发回手机 */
+    {
+      uint8_t ch = echo_char;
+      echo_pending = 0;
+      /* HAL 的已知坑：发送超时后 gState 会卡在 BUSY_TX，之后所有发送都被拒。
+         所以失败后手动复位状态，否则会"突然彻底发不出去" */
+      if (HAL_UART_Transmit(&huart1, &ch, 1, 5) != HAL_OK)
+      {
+        huart1.gState = HAL_UART_STATE_READY;
+      }
+    }
+
+    if (DEBUG_UART_HEARTBEAT && (HAL_GetTick() - dbg_tick) >= 1000)   /* 每秒发一次 "OK"，验证单片机→蓝牙方向 */
+    {
+      dbg_tick = HAL_GetTick();
+      if (HAL_UART_Transmit(&huart1, (uint8_t *)"OK\r\n", 4, 10) != HAL_OK)
+      {
+        huart1.gState = HAL_UART_STATE_READY;
+      }
+    }
+#endif
 
     /* ---- 1. 解析指令 ---- */
     if (cmd >= '0' && cmd <= '9')     /* 数字键 = 调速，不改变行驶方向 */
@@ -153,6 +410,9 @@ int main(void)
     }
 
     /* ---- 3. 按当前方向和速度执行 ---- */
+#if UART_SILENT_TEST || UART_SCAN_MODE || UART_SELFTEST_MODE
+    Car_Stop();      /* 诊断模式：不管收到什么都停车，防止线上噪声把车开走 */
+#else
     switch (g_dir)
     {
       case 1:  Car_Run(1,  g_speed);    break;
@@ -161,6 +421,7 @@ int main(void)
       case 3:  Car_TurnRight(g_speed);  break;
       default: Car_Stop();              break;
     }
+#endif
   }
   /* USER CODE END 3 */
 }
@@ -258,6 +519,39 @@ static void MX_TIM3_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 9600;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -351,6 +645,17 @@ static void Car_Stop(void)
 }
 
 /**
+  * @brief  判断一个字节是不是合法指令（只认 F/B/L/R/S 和 0~9）
+  *         作用：串口线上如果窜进乱码噪声，绝不能让它驱动电机
+  */
+static uint8_t Cmd_IsValid(uint8_t c)
+{
+  if (c == 'F' || c == 'B' || c == 'L' || c == 'R' || c == 'S') return 1;
+  if (c >= '0' && c <= '9') return 1;
+  return 0;
+}
+
+/**
   * @brief  串口接收完成回调（HAL 库在中断里调用它）
   *         收满 1 字节 → 存指令、记时间 → 立刻重新武装接收
   */
@@ -358,12 +663,66 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1)
   {
-    car_cmd = rx_byte;                       /* 存下收到的字符 */
-    last_cmd_tick = HAL_GetTick();           /* 记录时间，用于断连保护 */
+    rx_any_cnt++;        /* 仪表：收到任何字节都记一笔，主循环靠它点灯 */
+
+#if UART_SELFTEST_MODE
+    if (rx_byte == 0x55) { selftest_rx_cnt++; }   /* 自检：数一数收回来的测试字节 */
+#endif
+
+#if DEBUG_UART_ECHO && !UART_SELFTEST_MODE
+    /* 调试回显：只回显"合法指令"。
+       手机发 F → 手机收到 F，说明链路双向通；
+       线上窜进来的噪声字节一律不回显，手机屏幕保持干净 */
+    if (Cmd_IsValid(rx_byte))
+    {
+      echo_char    = rx_byte;
+      echo_pending = 1;
+    }
+#endif
+
+    /* 关键：只有合法指令才更新指令和时间戳。
+       否则线上的噪声会不断刷新 last_cmd_tick，把 800ms 断连保护彻底废掉 */
+    if (Cmd_IsValid(rx_byte))
+    {
+      car_cmd = rx_byte;                     /* 存下收到的字符 */
+      last_cmd_tick = HAL_GetTick();         /* 记录时间，用于断连保护 */
+    }
 
     HAL_UART_Receive_IT(&huart1, &rx_byte, 1);   /* 关键：重新开一次接收 */
   }
 }
+
+/**
+  * @brief  串口错误回调（溢出/帧错误/噪声都走这里）
+  *         作用：线上噪声太猛时串口会溢出，HAL 默认不再自动开接收 → 从此永远收不到数据。
+  *         手动清标志并重新武装，让串口能自己爬起来。
+  */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    __HAL_UART_CLEAR_OREFLAG(huart);        /* 读 SR + DR，清掉溢出标志 */
+    huart->RxState = HAL_UART_STATE_READY;  /* 解开可能卡在 BUSY_RX 的状态 */
+    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+  }
+}
+
+#if UART_SCAN_MODE
+/**
+  * @brief  波特率扫描：按编号设置 USART1 的波特率
+  * @param  idx 0~5，对应 9600 / 19200 / 38400 / 57600 / 115200 / 4800
+  * @note   直接写 BRR 寄存器，不做 HAL 重新初始化 —— 因为 HAL_UART_Init 在串口
+  *         正在发送时会返回 BUSY，而且会重配 GPIO，这样最干净也最快。
+  *         USART1 挂在 APB2（72MHz），默认 16 倍过采样 → BRR = 72MHz / 波特率
+  */
+static void UART_ScanApply(uint8_t idx)
+{
+  static const uint32_t bauds[6] = {9600, 19200, 38400, 57600, 115200, 4800};
+
+  huart1.Init.BaudRate = bauds[idx];
+  huart1.Instance->BRR = (uint16_t)((72000000UL + bauds[idx] / 2U) / bauds[idx]);
+}
+#endif
 /* USER CODE END 4 */
 
 /**
