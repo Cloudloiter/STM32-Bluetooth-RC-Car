@@ -41,6 +41,11 @@
                                    · 手机 App 不支持连发时，这个值就等于"一次指令能走多久"：
                                      10 秒足够看清动作，手机真掉线了车也不会跑飞 */
 #define SPEED_STEP       111    /* 档位 1~9 每档对应的 PWM 值（9×111≈999） */
+#define SPEED_MIN        300    /* 最低运行速度。低于这个占空比电机维持不住转动
+                                   （实测 250 即约 1V 只能空响，转不起来） */
+#define KICK_MS          150    /* 起步 boost 持续时间，单位 ms
+                                   从静止切换运动时先给满占空比冲刺这么久，
+                                   帮电机突破静摩擦，之后回落到目标档位 */
 
 /* 调试回显开关：1=手机发什么字符，单片机就原样发回去（用来确认蓝牙链路双向通）
    验收阶段保持 1；车能正常开了以后改成 0，模组就只会"听"不会"说" */
@@ -387,10 +392,16 @@ int main(void)
 #endif
 
     /* ---- 1. 解析指令 ---- */
-    if (cmd >= '0' && cmd <= '9')     /* 数字键 = 调速，不改变行驶方向 */
+    if (cmd >= '1' && cmd <= '9')     /* 1~9 = 调速，不改变行驶方向 */
     {
       g_speed = (uint16_t)(cmd - '0') * SPEED_STEP;
-      if (g_speed < 250) g_speed = 250;   /* 0 也保底给一点速度，否则等于停车 */
+      /* 保底：占空比太低电机维持不住转动。有了下面的起步 boost，
+         静止时低档也能起步，但运行中仍需要这个下限兜住 */
+      if (g_speed < SPEED_MIN) g_speed = SPEED_MIN;
+    }
+    else if (cmd == '0')              /* 0 = 停车（比 1 还慢没有意义，直接当停车键用） */
+    {
+      g_dir = 0;
     }
 
     switch (cmd)
@@ -413,13 +424,45 @@ int main(void)
 #if UART_SILENT_TEST || UART_SCAN_MODE || UART_SELFTEST_MODE
     Car_Stop();      /* 诊断模式：不管收到什么都停车，防止线上噪声把车开走 */
 #else
+    /* ================= 起步 boost（kick start） =================
+       直流电机的启动扭矩（要克服静摩擦）远大于维持扭矩（动摩擦）。
+       实测（电池 5.72V，电机端约 4V）：
+         · 静止直接给 3~7 档 → 只有堵转嗡响，8 档才起得来
+         · 但转起来后从 8 档降到 2 档 → 仍能维持慢速转动
+       对策：从"停"切到"走"（或反向）的瞬间，先给满占空比冲刺 KICK_MS 毫秒，
+             帮转子突破静摩擦，随后立即回落到用户设定的档位。
+       效果：低速档从静止也能起步，同时不牺牲正常调速手感。
+       ============================================================= */
+    static int8_t   last_dir  = 0;      /* 上一轮的方向，用来检测"起步"这个时刻 */
+    static uint8_t  kicking   = 0;      /* 是否正处于冲刺阶段 */
+    static uint32_t kick_tick = 0;
+
+    if ((g_dir != 0) && (g_dir != last_dir))   /* 起步 或 反向 → 触发冲刺 */
+    {
+      kicking   = 1;
+      kick_tick = HAL_GetTick();
+    }
+
+    if (g_dir == 0)                            /* 停车：立刻取消冲刺 */
+    {
+      kicking = 0;
+    }
+    else if (kicking && ((HAL_GetTick() - kick_tick) >= KICK_MS))
+    {
+      kicking = 0;                             /* 冲刺结束，回落到目标速度 */
+    }
+
+    last_dir = g_dir;
+
+    uint16_t out_speed = kicking ? PWM_MAX : g_speed;
+
     switch (g_dir)
     {
-      case 1:  Car_Run(1,  g_speed);    break;
-      case -1: Car_Run(-1, g_speed);    break;
-      case 2:  Car_TurnLeft(g_speed);   break;
-      case 3:  Car_TurnRight(g_speed);  break;
-      default: Car_Stop();              break;
+      case 1:  Car_Run(1,  out_speed);    break;
+      case -1: Car_Run(-1, out_speed);    break;
+      case 2:  Car_TurnLeft(out_speed);   break;
+      case 3:  Car_TurnRight(out_speed);  break;
+      default: Car_Stop();                break;
     }
 #endif
   }
