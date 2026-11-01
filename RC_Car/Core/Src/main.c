@@ -55,10 +55,16 @@
    注意这会和回显混在一起，手机屏幕上会一直刷。排查阶段够用了，现在关掉 */
 #define DEBUG_UART_HEARTBEAT 0
 
-/* ===== 广播率测试：改这一个数就能试不同波特率 =====
-   HC-05 常见出厂值：9600。被改过的话常见 38400 / 115200 / 57600 / 4800
-   判断标准：手机里能稳定看到"每秒一个 OK"，就是对的，其余都是错的 */
-#define UART_BAUD_TEST   9600
+/* ===== 串口波特率 =====
+   2026-11-01 晚：由 9600 降到 2400。
+   原因：模块 TXD 是弱输出（空载实测 0.99V，加上 MCU 内部 40k 上拉才 3.27V），
+         高电平全靠内部弱上拉拉起来，边沿上升很慢。9600 下每位只有 104us，
+         采样点被慢边沿拖到位的交界处，实测几乎每个字节都错 1 个 bit
+         （F->B、L->D、R->V、9->非法字符），错误率接近 100%。
+   2400 波特率下每位 417us，慢边沿有充足时间充到位，抗这种问题的余量是 9600 的 4 倍。
+   ⚠️ 改完必须同步把 HC-05 波特率也改掉：AT+UART=2400,0,0
+   注意：本值必须和模块一致，否则一个字节都收不到 */
+#define UART_BAUD_TEST   2400
 
 /* ===== 静默诊断开关 =====
    置 1：单片机完全不发任何串口数据，只用板载 LED 快闪表示程序在跑。
@@ -375,7 +381,9 @@ int main(void)
       echo_pending = 0;
       /* HAL 的已知坑：发送超时后 gState 会卡在 BUSY_TX，之后所有发送都被拒。
          所以失败后手动复位状态，否则会"突然彻底发不出去" */
-      if (HAL_UART_Transmit(&huart1, &ch, 1, 5) != HAL_OK)
+      /* 超时从 5ms 放宽到 20ms：2400 波特率下 1 字节要 4.2ms，
+         5ms 太贴边，偶发一次超时就会把 gState 卡死 */
+      if (HAL_UART_Transmit(&huart1, &ch, 1, 20) != HAL_OK)
       {
         huart1.gState = HAL_UART_STATE_READY;
       }
@@ -384,7 +392,7 @@ int main(void)
     if (DEBUG_UART_HEARTBEAT && (HAL_GetTick() - dbg_tick) >= 1000)   /* 每秒发一次 "OK"，验证单片机→蓝牙方向 */
     {
       dbg_tick = HAL_GetTick();
-      if (HAL_UART_Transmit(&huart1, (uint8_t *)"OK\r\n", 4, 10) != HAL_OK)
+      if (HAL_UART_Transmit(&huart1, (uint8_t *)"OK\r\n", 4, 50) != HAL_OK)
       {
         huart1.gState = HAL_UART_STATE_READY;
       }

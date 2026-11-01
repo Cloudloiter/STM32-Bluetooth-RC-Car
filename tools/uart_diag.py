@@ -6,6 +6,7 @@ USB-TTL（CH340）串口诊断工具 —— 用于直接和 HC-05 模块对话�
     python uart_diag.py list                 列出所有串口
     python uart_diag.py loop   COM3          环回测试（需要把 CH340 的 TX 和 RX 短接）
     python uart_diag.py at     COM3 [baud]   发 AT 指令（模块 EN 脚接 3.3V 后上电才有效，默认 38400）
+    python uart_diag.py cmd    COM3 38400 "AT+UART=2400,0,0"   发任意一条 AT 指令
     python uart_diag.py sniff  COM3 [baud]   只监听，不发送（看线上有没有数据）
     python uart_diag.py send   COM3 9600 46  按 9600 发一个十六进制字节，看有没有回应
 """
@@ -111,6 +112,22 @@ def send(port, baud, hexbyte):
         dump("回应", ser.read(256))
 
 
+def raw_cmd(port, baud, cmd):
+    """发任意一条 AT 指令，例如 AT+UART=2400,0,0"""
+    print(f"== 发送 [{cmd}] 到 {port} @ {baud} ==")
+    with serial.Serial(port, baud, timeout=0.8) as ser:
+        time.sleep(0.3)
+        ser.reset_input_buffer()
+        ser.write((cmd + "\r\n").encode())
+        time.sleep(0.5)
+        got = ser.read(256)
+        dump("回应", got)
+        if got:
+            print(">> 收到回应，指令已送达")
+        else:
+            print(">> 没回应：检查 EN 是否接高、是否已断电重上电、波特率是否 38400")
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -123,6 +140,8 @@ def main():
         loopback(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 9600)
     elif mode == "at":
         at_commands(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 38400)
+    elif mode == "cmd":
+        raw_cmd(sys.argv[2], int(sys.argv[3]), sys.argv[4])
     elif mode == "sniff":
         sniff(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 9600,
               int(sys.argv[4]) if len(sys.argv) > 4 else 6)
